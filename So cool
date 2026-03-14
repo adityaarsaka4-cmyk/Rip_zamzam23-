@@ -1,0 +1,378 @@
+import { useState, useEffect, useRef, useMemo, useCallback, memo } from "react";
+const M="'JetBrains Mono','Fira Code','Courier New',monospace";
+const FONT="system-ui,sans-serif";
+const throttle=(fn,ms)=>{let l=0;return(...a)=>{const n=Date.now();if(n-l>=ms){l=n;fn(...a);}}};
+function stdDev(arr){if(!arr.length)return 0;const mn=arr.reduce((a,b)=>a+b,0)/arr.length;return Math.sqrt(arr.reduce((a,b)=>a+(b-mn)**2,0)/arr.length);}
+async function sha256hex(str){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(str));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,"0")).join("");}
+
+// ── Shared Ticker ──────────────────────────────────────────────
+let _tId=null;const _tCbs=new Set();let _tN=0;
+const subTick=fn=>{_tCbs.add(fn);if(!_tId)_tId=setInterval(()=>{_tN++;_tCbs.forEach(f=>{try{f(_tN);}catch(e){}});},400);return()=>{_tCbs.delete(fn);if(!_tCbs.size){clearInterval(_tId);_tId=null;_tN=0;}};};
+function useTick(fn){const r=useRef(fn);r.current=fn;useEffect(()=>subTick(n=>r.current(n)),[]);}
+function useDebouncedValue(v,d){const[s,ss]=useState(v);useEffect(()=>{const id=setTimeout(()=>ss(v),d||300);return()=>clearTimeout(id);},[v,d]);return s;}
+
+// ── Session / Audit ────────────────────────────────────────────
+const SESSION={id:Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b=>b.toString(16).padStart(2,"0")).join(""),start:Date.now(),events:0,threats:0};
+const AUDIT_BUS={_ls:new Map(),_id:0,log:[],sub(fn){const id=++this._id;this._ls.set(id,fn);return id;},unsub(id){this._ls.delete(id);}};
+let _aqFlush=null;const _aq=[];
+let _chainState="genesis-"+SESSION.id.slice(0,8);
+let _alertFired=false;
+
+function emitAudit(ev){
+  const now=new Date();
+  const ts=String(now.getHours()).padStart(2,"0")+":"+String(now.getMinutes()).padStart(2,"0")+":"+String(now.getSeconds()).padStart(2,"0")+"."+String(now.getMilliseconds()).padStart(3,"0");
+  const e={id:Date.now()+Math.random(),ts,seq:++SESSION.events,...ev};
+  if(_aq.length>200)_aq.shift();_aq.push(e);
+  if(["HIGH","CRITICAL"].includes(ev.severity))SESSION.threats++;
+  if(!_aqFlush){
+    const flush=()=>{
+      const b=_aq.splice(0);
+      if(b.length){
+        const allR=[...b,...AUDIT_BUS.log.slice(0,20)];
+        const highCnt=allR.filter(e2=>["HIGH","CRITICAL"].includes(e2.severity)).length;
+        if(highCnt>=3&&!_alertFired){
+          _alertFired=true;setTimeout(()=>{_alertFired=false;},60000);
+          const n2=new Date();
+          const ts2=`${String(n2.getHours()).padStart(2,"0")}:${String(n2.getMinutes()).padStart(2,"0")}:${String(n2.getSeconds()).padStart(2,"0")}`;
+          b.push({id:Date.now()+.5,ts:ts2,seq:++SESSION.events,layer:"ALERT",type:"THRESHOLD",severity:"CRITICAL",msg:"🚨 "+highCnt+" threats in window — mitigation active"});
+          SESSION.threats+=5;
+        }
+        b.forEach(entry=>{
+          sha256hex(_chainState+(entry.ts||"")+(entry.type||"")+(entry.msg||"")).then(h=>{_chainState=h;entry.chain=h.slice(0,12);});
+        });
+        AUDIT_BUS.log=[...b,...AUDIT_BUS.log].slice(0,50);
+        b.forEach(entry=>IDB.put(entry));
+        AUDIT_BUS._ls.forEach(fn=>{try{fn(AUDIT_BUS.log[0]);}catch(e){}});
+      }
+      _aqFlush=null;
+    };
+    _aqFlush=typeof requestIdleCallback!=="undefined"?requestIdleCallback(flush,{timeout:800}):setTimeout(flush,800);
+  }
+}
+
+// ── IndexedDB Encrypted Audit Store ───────────────────────────
+const IDB=(()=>{
+  const DB="nexus-audit-v2",ST="logs";
+  let _db=null;
+  async function open(){
+    if(_db)return _db;
+    return new Promise((res,rej)=>{
+      const req=indexedDB.open(DB,1);
+      req.onupgradeneeded=e=>{const db=e.target.result;if(!db.objectStoreNames.contains(ST))db.createObjectStore(ST,{keyPath:"id"});};
+      req.onsuccess=e=>{_db=e.target.result;res(_db);};
+      req.onerror=()=>rej(req.error);
+    });
+  }
+  async function put(entry){
+    try{
+      const db=await open();
+      const enc=await STOR._enc(entry);
+      await new Promise((res,rej)=>{const tx=db.transaction(ST,"readwrite");const r=tx.objectStore(ST).put({id:String(entry.id),data:enc});r.onsuccess=res;r.onerror=rej;});
+    }catch(e){}
+  }
+  async function getAll(){
+    try{
+      const db=await open();
+      const rows=await new Promise((res,rej)=>{const tx=db.transaction(ST,"readonly");const r=tx.objectStore(ST).getAll();r.onsuccess=()=>res(r.result||[]);r.onerror=rej;});
+      const dec=await Promise.all(rows.map(r=>STOR._dec(r.data).catch(()=>null)));
+      return dec.filter(Boolean).sort((a,b)=>(b.seq||0)-(a.seq||0)).slice(0,300);
+    }catch(e){return[];}
+  }
+  async function count(){try{const db=await open();return new Promise((res,rej)=>{const tx=db.transaction(ST,"readonly");const r=tx.objectStore(ST).count();r.onsuccess=()=>res(r.result);r.onerror=()=>res(0);});}catch(e){return 0;}}
+  async function clear(){try{const db=await open();await new Promise((res,rej)=>{const tx=db.transaction(ST,"readwrite");const r=tx.objectStore(ST).clear();r.onsuccess=res;r.onerror=rej;});}catch(e){}}
+  return Object.freeze({put,getAll,count,clear});
+})();
+
+// ── PBKDF2-AES encrypted STOR ─────────────────────────────────
+const _eskCache={};
+async function _getEsk(){
+  if(_eskCache.k)return _eskCache.k;
+  const pw=new TextEncoder().encode("nsk-"+SESSION.id.slice(0,10)+"-"+SESSION.start.toString(36));
+  const salt=new TextEncoder().encode("nexus-pbkdf2-salt-v1");
+  const base=await crypto.subtle.importKey("raw",pw,{name:"PBKDF2"},false,["deriveKey"]);
+  _eskCache.k=await crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:50000,hash:"SHA-256"},base,{name:"AES-GCM",length:256},false,["encrypt","decrypt"]);
+  return _eskCache.k;
+}
+const STOR={
+  async _enc(v){
+    try{
+      const k=await _getEsk();
+      const iv=crypto.getRandomValues(new Uint8Array(12));
+      const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},k,new TextEncoder().encode(JSON.stringify(v)));
+      const hex=a=>Array.from(a).map(b=>b.toString(16).padStart(2,"0")).join("");
+      return JSON.stringify({_ne:1,iv:hex(iv),ct:hex(new Uint8Array(ct))});
+    }catch(e){return JSON.stringify(v);}
+  },
+  async _dec(raw){
+    try{
+      const p=JSON.parse(raw);
+      if(!p._ne)return JSON.parse(raw);
+      const k=await _getEsk();
+      const fh=h=>new Uint8Array(h.match(/.{2}/g).map(b=>parseInt(b,16)));
+      const plain=await crypto.subtle.decrypt({name:"AES-GCM",iv:fh(p.iv)},k,fh(p.ct));
+      return JSON.parse(new TextDecoder().decode(plain));
+    }catch(e){return null;}
+  },
+  async get(k){try{const r=await window.storage.get(k);if(!r)return null;return this._dec(r.value);}catch(e){return null;}},
+  async set(k,v){try{const enc=await this._enc(v);await window.storage.set(k,enc);}catch(e){}},
+  async del(k){try{await window.storage.delete(k);}catch(e){}}
+};
+
+// ── IntegrityGuard ─────────────────────────────────────────────
+const IntegrityGuard=(()=>{
+  const _snaps=new Map();
+  let _running=false,_violations=0,_iid=null;
+  const _targets=[];
+  async function _hash(fn){
+    try{const src=typeof fn==="function"?fn.toString():JSON.stringify(fn);return await sha256hex(src+SESSION.id.slice(0,6));}catch(e){return null;}
+  }
+  function addTarget(label,getFn){_targets.push([label,getFn]);}
+  async function verify(){
+    for(const[label,getFn] of _targets){
+      try{
+        const cur=await _hash(getFn());
+        const exp=_snaps.get(label);
+        if(!exp||!cur)continue;
+        if(cur!==exp){_violations++;emitAudit({layer:"INTEGRITY",type:"TAMPER_DETECTED",severity:"CRITICAL",msg:"["+label+"] hash mismatch — violation #"+_violations});
+          if(_violations>=3){emitAudit({layer:"INTEGRITY",type:"LOCKDOWN",severity:"CRITICAL",msg:"3+ violations — integrity lockdown"});stop();}}
+      }catch(e){}
+    }
+  }
+  async function start(){
+    if(_running)return;_running=true;
+    for(const[label,getFn] of _targets){const h=await _hash(getFn());if(h)_snaps.set(label,h);}
+    _iid=setInterval(()=>{verify();},8000);
+    emitAudit({layer:"INTEGRITY",type:"GUARD_START",severity:"OK",msg:"IntegrityGuard active — "+_targets.length+" targets"});
+  }
+  function stop(){if(_iid){clearInterval(_iid);_iid=null;_running=false;}}
+  return Object.freeze({addTarget,start,stop,getViolations:()=>_violations});
+})();
+
+// ── TamperDetector ─────────────────────────────────────────────
+const TamperDetector={
+  _active:false,
+  start(){
+    if(this._active)return;this._active=true;
+    try{
+      const obs=new MutationObserver(muts=>{for(const m of muts)for(const n of(m.addedNodes||[])){const tag=(n.tagName||"").toUpperCase();if(["SCRIPT","IFRAME","OBJECT","EMBED"].includes(tag))emitAudit({layer:"TAMPER",type:"NODE_INJECT",severity:"CRITICAL",msg:"Suspicious <"+tag+"> injected into DOM"});}});
+      obs.observe(document.documentElement,{childList:true,subtree:true});
+    }catch(e){}
+    window.addEventListener("blur",()=>emitAudit({layer:"TAMPER",type:"WIN_BLUR",severity:"INFO",msg:"Window focus lost"}));
+    window.addEventListener("focus",()=>emitAudit({layer:"TAMPER",type:"WIN_FOCUS",severity:"INFO",msg:"Window focus restored"}));
+    window.addEventListener("beforeunload",()=>emitAudit({layer:"TAMPER",type:"UNLOAD",severity:"WARN",msg:"Page unload detected"}));
+    document.addEventListener("contextmenu",()=>emitAudit({layer:"TAMPER",type:"CTX_MENU",severity:"INFO",msg:"Context menu opened"}));
+    try{const _ol=console.log,_oe=console.error,_ow=console.warn;let _cc=0,_cd=false;const _cw=f=>function(...a){if(!_cd){_cd=true;_cc++;if(_cc<=50)emitAudit({layer:"TAMPER",type:"CONSOLE_USE",severity:"WARN",msg:"Console accessed (total:"+_cc+"x)"});_cd=false;}return f.apply(console,a);};console.log=_cw(_ol);console.error=_cw(_oe);console.warn=_cw(_ow);}catch(e){}
+    emitAudit({layer:"TAMPER",type:"INIT",severity:"OK",msg:"TamperDetector active"});
+  }
+};
+
+// ── RateLimiter ────────────────────────────────────────────────
+const getBackoffSec=f=>[0,5,15,60,300,900][Math.min(f,5)];
+const RL={
+  LIMITS:{login:{max:5,win:60000},challenge:{max:10,win:30000},global:{max:300,win:60000}},
+  async check(action){
+    const key="nrl-"+action,now=Date.now();
+    const base=this.LIMITS[action]||{max:20,win:10000};
+    if(action!=="global"){const g=await this.check("global");if(!g.ok)return{ok:false,remaining:0};}
+    let hits=(await STOR.get(key))||[];
+    hits=hits.filter(t=>now-t<base.win);
+    if(hits.length>=base.max){emitAudit({layer:"RL",type:"RATE_LIMIT",severity:"HIGH",msg:"Rate limit: "+action});return{ok:false,remaining:0};}
+    hits.push(now);await STOR.set(key,hits.slice(-base.max));
+    return{ok:true,remaining:base.max-hits.length};
+  },
+  async status(action){
+    const key="nrl-"+action,now=Date.now();
+    const base=this.LIMITS[action]||{max:20,win:10000};
+    let hits=(await STOR.get(key))||[];hits=hits.filter(t=>now-t<base.win);
+    return{action,used:hits.length,max:base.max,pct:Math.round(hits.length/base.max*100)};
+  },
+  async reset(action){await STOR.del("nrl-"+action);}
+};
+Object.freeze(RL);
+
+IntegrityGuard.addTarget("RL.check",()=>RL.check);
+IntegrityGuard.addTarget("RL.status",()=>RL.status);
+IntegrityGuard.addTarget("sha256hex",()=>sha256hex);
+IntegrityGuard.addTarget("emitAudit",()=>emitAudit);
+IntegrityGuard.addTarget("STOR._enc",()=>STOR._enc);
+IntegrityGuard.addTarget("STOR._dec",()=>STOR._dec);
+IntegrityGuard.addTarget("IDB.put",()=>IDB.put);
+IntegrityGuard.addTarget("getBackoffSec",()=>getBackoffSec);
+
+// ── CryptoBackend ──────────────────────────────────────────────
+const CB=(()=>{
+  let _hk=null,_ak=null,_ready=false;
+  const b64u=s=>btoa(s).replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_");
+  const fromb64u=s=>atob(s.replace(/-/g,"+").replace(/_/g,"/")+("==".slice(0,(4-s.length%4)%4)));
+  async function init(){
+    try{
+      const rawArr=Array.from(crypto.getRandomValues(new Uint8Array(32)));
+      [_hk,_ak]=await Promise.all([
+        crypto.subtle.importKey("raw",new Uint8Array(rawArr),{name:"HMAC",hash:"SHA-256"},false,["sign","verify"]),
+        crypto.subtle.generateKey({name:"AES-GCM",length:256},false,["encrypt","decrypt"])
+      ]);
+      _ready=true;emitAudit({layer:"CB",type:"READY",severity:"OK",msg:"CryptoBackend initialized"});
+    }catch(e){emitAudit({layer:"CB",type:"FAIL",severity:"CRITICAL",msg:"Init failed: "+e.message});}
+  }
+  async function signJWT(payload){
+    if(!_ready)await init();
+    const jti=Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b=>b.toString(16).padStart(2,"0")).join("");
+    const nonce=Array.from(crypto.getRandomValues(new Uint8Array(4))).map(b=>b.toString(16).padStart(2,"0")).join("");
+    const h=b64u(JSON.stringify({alg:"HS256",typ:"JWT"}));
+    const b=b64u(JSON.stringify({...payload,jti,nonce,iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+3600}));
+    const msg=new TextEncoder().encode(h+"."+b);
+    const sig=await crypto.subtle.sign("HMAC",_hk,msg);
+    return h+"."+b+"."+b64u(String.fromCharCode(...new Uint8Array(sig)));
+  }
+  async function verifyJWT(token){
+    if(!_ready||!token)return null;
+    try{
+      const pts=token.split(".");if(pts.length<3)return null;
+      const msg=new TextEncoder().encode(pts[0]+"."+pts[1]);
+      const sig=Uint8Array.from(fromb64u(pts[2]),c=>c.charCodeAt(0));
+      if(!(await crypto.subtle.verify("HMAC",_hk,sig,msg)))return null;
+      const p=JSON.parse(fromb64u(pts[1]));
+      return Math.floor(Date.now()/1000)<p.exp?p:null;
+    }catch(e){return null;}
+  }
+  async function encryptAES(pt){
+    if(!_ready)await init();
+    const iv=crypto.getRandomValues(new Uint8Array(12));
+    const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},_ak,new TextEncoder().encode(pt));
+    const hex=a=>Array.from(a).map(b=>b.toString(16).padStart(2,"0")).join("");
+    return{iv:hex(iv),ct:hex(new Uint8Array(ct))};
+  }
+  async function decryptAES(enc){
+    if(!_ready)return null;
+    try{
+      const fh=h=>new Uint8Array(h.match(/.{2}/g).map(b=>parseInt(b,16)));
+      const plain=await crypto.subtle.decrypt({name:"AES-GCM",iv:fh(enc.iv)},_ak,fh(enc.ct));
+      return new TextDecoder().decode(plain);
+    }catch(e){return null;}
+  }
+  return Object.freeze({init,signJWT,verifyJWT,encryptAES,decryptAES,get ready(){return _ready;}});
+})();
+
+// ── Globals ────────────────────────────────────────────────────
+const _adj=["ALPHA","BETA","GAMMA","DELTA","SIGMA","OMEGA","ZETA","NEXUS","VEGA","ORION"][Math.floor(Math.random()*10)];
+const _ts=Date.now().toString(36).toUpperCase().slice(-4);
+const _rng=Array.from(crypto.getRandomValues(new Uint8Array(3))).map(b=>b.toString(16).padStart(2,"0")).join("").toUpperCase();
+const VISITOR={id:"VIS-"+_adj+"-"+_ts+"-"+_rng,shortId:_adj+"-"+_ts};
+const SEV={CRITICAL:{color:"#ef4444",bg:"#1a0505",border:"#ef444433",icon:"🔴"},HIGH:{color:"#f97316",bg:"#1a0c00",border:"#f9731633",icon:"🟠"},WARN:{color:"#fbbf24",bg:"#1a1400",border:"#fbbf2433",icon:"🟡"},INFO:{color:"#22d3ee",bg:"#00141a",border:"#22d3ee22",icon:"🔵"},OK:{color:"#4ade80",bg:"#031a0e",border:"#4ade8022",icon:"🟢"}};
+const L3_ANS=["rip_zamzam23","putri","meur","shafar","laila"];
+const L4_ANS=["meurfanmelikebladeba","nexusai","qmwnebrvtcyxuz"];
+const MK_KEY="nexus-mk-history";let _mkCopy=false;
+
+// ── Baby Playground constants ──────────────────────────────────
+const BABY_COLORS=["#ff6b6b","#ffd93d","#6bcb77","#4d96ff","#ff6bff","#ff9a3c","#a29bfe","#fd79a8"];
+const PUZZLE_BTNS=[
+  {id:"a",label:"🐣",correct:false},{id:"b",label:"⭐",correct:true},
+  {id:"c",label:"🌈",correct:false},{id:"d",label:"🍭",correct:false},
+  {id:"e",label:"🎈",correct:false},{id:"f",label:"🦄",correct:false},
+];
+const WORD_HINTS=["kucing","bintang","pelangi","bunga","balon"];
+const BLOCK_DATA=[
+  {id:1,color:"#ff6b6b",label:"🔴",shape:"square"},
+  {id:2,color:"#ffd93d",label:"🟡",shape:"square"},
+  {id:3,color:"#6bcb77",label:"🟢",shape:"square"},
+  {id:4,color:"#4d96ff",label:"🔵",shape:"square"},
+  {id:5,color:"#a29bfe",label:"🟣",shape:"square"},
+];
+
+// ── Fun Sound Engine ──────────────────────────────────────────
+const playWin=()=>{
+  try{
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    const notes=[523,659,784,1047,1319];
+    notes.forEach((freq,i)=>{
+      const o=ctx.createOscillator();const g=ctx.createGain();
+      o.connect(g);g.connect(ctx.destination);
+      o.type="sine";o.frequency.setValueAtTime(freq,ctx.currentTime+i*.12);
+      g.gain.setValueAtTime(0,ctx.currentTime+i*.12);
+      g.gain.linearRampToValueAtTime(.4,ctx.currentTime+i*.12+.04);
+      g.gain.linearRampToValueAtTime(0,ctx.currentTime+i*.12+.28);
+      o.start(ctx.currentTime+i*.12);o.stop(ctx.currentTime+i*.12+.3);
+    });
+  }catch(e){}
+};
+const playPop=()=>{
+  try{
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    const o=ctx.createOscillator();const g=ctx.createGain();
+    o.connect(g);g.connect(ctx.destination);
+    o.type="sine";o.frequency.setValueAtTime(880,ctx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(440,ctx.currentTime+.1);
+    g.gain.setValueAtTime(.3,ctx.currentTime);g.gain.linearRampToValueAtTime(0,ctx.currentTime+.15);
+    o.start();o.stop(ctx.currentTime+.15);
+  }catch(e){}
+};
+const playWrong=()=>{
+  try{
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    const o=ctx.createOscillator();const g=ctx.createGain();
+    o.connect(g);g.connect(ctx.destination);
+    o.type="sawtooth";o.frequency.setValueAtTime(220,ctx.currentTime);
+    g.gain.setValueAtTime(.15,ctx.currentTime);g.gain.linearRampToValueAtTime(0,ctx.currentTime+.18);
+    o.start();o.stop(ctx.currentTime+.18);
+  }catch(e){}
+};
+
+// ── Self-Destruct Sound ────────────────────────────────────────
+const playBeep=(freq=880,dur=.08)=>{
+  try{
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    const o=ctx.createOscillator(),g=ctx.createGain();
+    o.connect(g);g.connect(ctx.destination);
+    o.type="square";o.frequency.value=freq;
+    g.gain.setValueAtTime(.25,ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+dur);
+    o.start();o.stop(ctx.currentTime+dur);
+  }catch(e){}
+};
+const playAlarm=()=>{
+  try{
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    [0,.12,.24].forEach(offset=>{
+      const o=ctx.createOscillator(),g=ctx.createGain();
+      o.connect(g);g.connect(ctx.destination);
+      o.type="sawtooth";
+      o.frequency.setValueAtTime(440,ctx.currentTime+offset);
+      o.frequency.linearRampToValueAtTime(880,ctx.currentTime+offset+.06);
+      g.gain.setValueAtTime(.3,ctx.currentTime+offset);
+      g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+offset+.1);
+      o.start(ctx.currentTime+offset);o.stop(ctx.currentTime+offset+.12);
+    });
+  }catch(e){}
+};
+const playBoom=()=>{
+  try{
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    const buf=ctx.createBuffer(1,ctx.sampleRate*.8,ctx.sampleRate);
+    const d=buf.getChannelData(0);
+    for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,1.5);
+    const src=ctx.createBufferSource(),g=ctx.createGain(),flt=ctx.createBiquadFilter();
+    flt.type="lowpass";flt.frequency.value=400;
+    src.buffer=buf;src.connect(flt);flt.connect(g);g.connect(ctx.destination);
+    g.gain.setValueAtTime(.9,ctx.currentTime);g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.8);
+    src.start();
+  }catch(e){}
+};
+
+// ── Self-Destruct Screen ───────────────────────────────────────
+function SelfDestructScreen({onReset}){
+  const[count,setCount]=useState(10);const[phase,setPhase]=useState("countdown");const[glitch,setGlitch]=useState(false);
+  useEffect(()=>{
+    playAlarm();
+    const tick=setInterval(()=>{
+      setCount(c=>{
+        const next=c-1;
+        playAlarm();
+        setGlitch(true);setTimeout(()=>setGlitch(false),120);
+        if(next<=0){clearInterval(tick);setPhase("boom");playBoom();return 0;}
+        return next;
+      });
+    },1000);
+    return()=>clearInterval(tick);
+  },[]);
+  const CHARS="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+  const rnd=n=>Array.from({length:n},()=>CHARS
